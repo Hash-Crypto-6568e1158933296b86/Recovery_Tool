@@ -26,7 +26,6 @@ import (
 const (
 	progressFile    = "progresso.json"
 	batchSize       = 1000
-	cacheSize       = 50000
 	maxQueueSize    = 100000
 	progressSaveSec = 30
 )
@@ -44,7 +43,18 @@ var (
                 BIP39 Recovery Tool - BIP44 CUSTOM INDEX
 `
 	bip39WordList []string
+	wordToIndex   map[string]int
 	netParams     = &chaincfg.MainNetParams
+
+	// checksumBitsForWordCount mapeia o número de palavras BIP39 para o número
+	// de bits de checksum (definido pela spec: ENT+CS = 11*n, CS = ENT/32).
+	checksumBitsForWordCount = map[int]int{
+		12: 4,
+		15: 5,
+		18: 6,
+		21: 7,
+		24: 8,
+	}
 	languageFiles = map[string]string{
 		"a": "english.txt",
 		"b": "portuguese.txt",
@@ -78,7 +88,6 @@ type SmartScheduler struct {
 	sync.RWMutex
 	highPriorityWords  []string
 	wordFrequency      map[string]int
-	testedCombinations *sync.Map
 	performanceMetrics map[string]float64
 }
 
@@ -86,7 +95,6 @@ func NewSmartScheduler() *SmartScheduler {
 	return &SmartScheduler{
 		highPriorityWords:  make([]string, 0),
 		wordFrequency:      make(map[string]int),
-		testedCombinations: &sync.Map{},
 		performanceMetrics: make(map[string]float64),
 	}
 }
@@ -124,50 +132,7 @@ func (ss *SmartScheduler) GetPriorityWords() []string {
 	return ss.highPriorityWords
 }
 
-func (ss *SmartScheduler) IsTested(combo string) bool {
-	_, exists := ss.testedCombinations.Load(combo)
-	return exists
-}
-
-func (ss *SmartScheduler) MarkTested(combo string) {
-	ss.testedCombinations.Store(combo, true)
-}
-
-type AddressCache struct {
-	sync.RWMutex
-	cache map[string]string
-	keys  []string
-}
-
-func NewAddressCache(size int) *AddressCache {
-	return &AddressCache{
-		cache: make(map[string]string),
-		keys:  make([]string, 0, size),
-	}
-}
-
-func (ac *AddressCache) Get(mnemonic string) (string, bool) {
-	ac.RLock()
-	defer ac.RUnlock()
-	addr, exists := ac.cache[mnemonic]
-	return addr, exists
-}
-
-func (ac *AddressCache) Set(mnemonic, address string) {
-	ac.Lock()
-	defer ac.Unlock()
-
-	if len(ac.keys) >= cacheSize {
-		delete(ac.cache, ac.keys[0])
-		ac.keys = ac.keys[1:]
-	}
-
-	ac.cache[mnemonic] = address
-	ac.keys = append(ac.keys, mnemonic)
-}
-
 var (
-	addressCache   = NewAddressCache(cacheSize)
 	smartScheduler = NewSmartScheduler()
 )
 
@@ -175,6 +140,11 @@ func init() {
 	selectLanguage()
 	loadBIP39Dictionary()
 	sort.Strings(bip39WordList)
+
+	wordToIndex = make(map[string]int, len(bip39WordList))
+	for i, w := range bip39WordList {
+		wordToIndex[w] = i
+	}
 }
 
 func selectLanguage() {
@@ -280,6 +250,49 @@ func calculateChecksum(data []byte) []byte {
 	firstSHA := sha256.Sum256(data)
 	secondSHA := sha256.Sum256(firstSHA[:])
 	return secondSHA[:4]
+}
+
+// fastChecksumValid verifica o checksum BIP39 de uma sequência de índices de
+// palavras (0-2047 cada) SEM rodar PBKDF2/derivação BIP32. Isso descarta
+// ~(1 - 1/2^CS) das permutações (93.75% para 12 palavras, 99.6% para 24
+// palavras) usando apenas um SHA256 sobre a entropia reconstruída, que é
+// ordens de magnitude mais barato que gerar o endereço completo.
+func fastChecksumValid(wordIdx []int, entBits, csBits int) bool {
+	n := len(wordIdx)
+	entropy := make([]byte, entBits/8)
+
+	var acc uint32
+	accBits := 0
+	bytePos := 0
+
+	for i := 0; i < n; i++ {
+		var bits, nbits int
+		if i < n-1 {
+			bits = wordIdx[i]
+			nbits = 11
+		} else {
+			// A última palavra contribui apenas com os bits mais
+			// significativos para a entropia; os bits menos
+			// significativos são o próprio checksum.
+			bits = wordIdx[i] >> uint(csBits)
+			nbits = 11 - csBits
+		}
+
+		acc = (acc << uint(nbits)) | uint32(bits)
+		accBits += nbits
+
+		for accBits >= 8 {
+			accBits -= 8
+			entropy[bytePos] = byte(acc >> uint(accBits))
+			bytePos++
+		}
+	}
+
+	hash := sha256.Sum256(entropy)
+	checksumFromHash := int(hash[0] >> uint(8-csBits))
+	checksumFromWords := wordIdx[n-1] & ((1 << uint(csBits)) - 1)
+
+	return checksumFromHash == checksumFromWords
 }
 
 func privateKeyToWIF(privateKeyBytes []byte, compressed bool) (string, error) {
@@ -407,26 +420,73 @@ const (
 	StrategyMonteCarlo
 )
 
+// PermCandidate é uma mnemonic com checksum BIP39 válido, pronta para ir aos
+// workers, junto com o rank (posição) dela no espaço total de permutações -
+// usado para progresso/ETA/resume.
+type PermCandidate struct {
+	mnemonic string
+	rank     int64
+}
+
 type SmartPermutationGenerator struct {
 	words        []string
+	wordBip39Idx []int // wordBip39Idx[i] = índice (0-2047) de words[i] na wordlist BIP39
 	totalPerms   int64
 	currentIndex int64
 	strategy     GenerationStrategy
 	priority     []string
+	entBits      int
+	csBits       int
 }
 
 func NewSmartPermutationGenerator(words []string, startIndex int64, strategy GenerationStrategy, priorityWords []string) *SmartPermutationGenerator {
+	n := len(words)
+	bip39Idx := make([]int, n)
+	for i, w := range words {
+		bip39Idx[i] = wordToIndex[w]
+	}
+
+	csBits := checksumBitsForWordCount[n]
+	entBits := 11*n - csBits
+
 	return &SmartPermutationGenerator{
 		words:        words,
-		totalPerms:   factorial(len(words)),
+		wordBip39Idx: bip39Idx,
+		totalPerms:   factorial(n),
 		currentIndex: startIndex,
 		strategy:     strategy,
 		priority:     priorityWords,
+		entBits:      entBits,
+		csBits:       csBits,
 	}
 }
 
-func (spg *SmartPermutationGenerator) Generate() <-chan string {
-	ch := make(chan string, 1000)
+// checksumOK testa o checksum BIP39 de uma permutação dada por índices LOCAIS
+// (posições 0..n-1 dentro de spg.words), sem alocar strings nem rodar
+// PBKDF2/BIP32. Esse é o filtro que descarta a grande maioria das
+// permutações antes de qualquer trabalho caro.
+func (spg *SmartPermutationGenerator) checksumOK(order []int) bool {
+	n := len(order)
+	actual := make([]int, n)
+	for i, localIdx := range order {
+		actual[i] = spg.wordBip39Idx[localIdx]
+	}
+	return fastChecksumValid(actual, spg.entBits, spg.csBits)
+}
+
+// checksumOKWords é a mesma verificação, mas a partir das próprias palavras
+// (usado pela estratégia Monte Carlo, que já trabalha com strings).
+func (spg *SmartPermutationGenerator) checksumOKWords(perm []string) bool {
+	n := len(perm)
+	actual := make([]int, n)
+	for i, w := range perm {
+		actual[i] = wordToIndex[w]
+	}
+	return fastChecksumValid(actual, spg.entBits, spg.csBits)
+}
+
+func (spg *SmartPermutationGenerator) Generate() <-chan PermCandidate {
+	ch := make(chan PermCandidate, 1000)
 
 	go func() {
 		defer close(ch)
@@ -446,7 +506,7 @@ func (spg *SmartPermutationGenerator) Generate() <-chan string {
 	return ch
 }
 
-func (spg *SmartPermutationGenerator) generateSequential(ch chan string) {
+func (spg *SmartPermutationGenerator) generateSequential(ch chan PermCandidate) {
 	n := len(spg.words)
 	indices := make([]int, n)
 	for i := range indices {
@@ -459,12 +519,13 @@ func (spg *SmartPermutationGenerator) generateSequential(ch chan string) {
 
 	count := spg.currentIndex
 	for count < spg.totalPerms {
-		perm := make([]string, n)
-		for i, idx := range indices {
-			perm[i] = spg.words[idx]
+		if spg.checksumOK(indices) {
+			perm := make([]string, n)
+			for i, idx := range indices {
+				perm[i] = spg.words[idx]
+			}
+			ch <- PermCandidate{mnemonic: strings.Join(perm, " "), rank: count}
 		}
-
-		ch <- strings.Join(perm, " ")
 		count++
 
 		if count >= spg.totalPerms {
@@ -477,7 +538,7 @@ func (spg *SmartPermutationGenerator) generateSequential(ch chan string) {
 	}
 }
 
-func (spg *SmartPermutationGenerator) generatePriorityFirst(ch chan string) {
+func (spg *SmartPermutationGenerator) generatePriorityFirst(ch chan PermCandidate) {
 	priorityIndices := make([]int, 0)
 
 	for i, word := range spg.words {
@@ -497,7 +558,7 @@ func (spg *SmartPermutationGenerator) generatePriorityFirst(ch chan string) {
 	spg.generateSmartPermutations(ch, priorityIndices)
 }
 
-func (spg *SmartPermutationGenerator) generateSmartPermutations(ch chan string, priorityIndices []int) {
+func (spg *SmartPermutationGenerator) generateSmartPermutations(ch chan PermCandidate, priorityIndices []int) {
 	n := len(spg.words)
 	indices := make([]int, n)
 	for i := range indices {
@@ -524,12 +585,13 @@ func (spg *SmartPermutationGenerator) generateSmartPermutations(ch chan string, 
 		}
 
 		if hasPriorityClose || skipCount == 0 {
-			perm := make([]string, n)
-			for i, idx := range indices {
-				perm[i] = spg.words[idx]
+			if spg.checksumOK(indices) {
+				perm := make([]string, n)
+				for i, idx := range indices {
+					perm[i] = spg.words[idx]
+				}
+				ch <- PermCandidate{mnemonic: strings.Join(perm, " "), rank: count}
 			}
-
-			ch <- strings.Join(perm, " ")
 			if skipCount > 0 {
 				skipCount--
 			} else {
@@ -547,16 +609,18 @@ func (spg *SmartPermutationGenerator) generateSmartPermutations(ch chan string, 
 	}
 }
 
-func (spg *SmartPermutationGenerator) generateBinarySplit(ch chan string) {
+func (spg *SmartPermutationGenerator) generateBinarySplit(ch chan PermCandidate) {
 	spg.generateSequential(ch)
 }
 
-func (spg *SmartPermutationGenerator) generateMonteCarlo(ch chan string) {
+func (spg *SmartPermutationGenerator) generateMonteCarlo(ch chan PermCandidate) {
 	rng := time.Now().UnixNano()
 
 	for i := spg.currentIndex; i < spg.totalPerms && i < spg.currentIndex+1000000; i++ {
 		perm := spg.generateBiasedRandomPermutation(rng + int64(i))
-		ch <- strings.Join(perm, " ")
+		if spg.checksumOKWords(perm) {
+			ch <- PermCandidate{mnemonic: strings.Join(perm, " "), rank: i}
+		}
 	}
 }
 
@@ -675,10 +739,6 @@ Derivation: %s
 
 // generateAddressFromMnemonicBIP44 gera endereço Legacy para índice específico
 func generateAddressFromMnemonicBIP44(mnemonic, passphrase string, addressIndex uint32) (string, error) {
-	if addr, exists := addressCache.Get(mnemonic); exists {
-		return addr, nil
-	}
-
 	seed := bip39.NewSeed(mnemonic, passphrase)
 	masterKey, err := hdkeychain.NewMaster(seed, netParams)
 	if err != nil {
@@ -696,13 +756,7 @@ func generateAddressFromMnemonicBIP44(mnemonic, passphrase string, addressIndex 
 		return "", err
 	}
 
-	address, err := generateLegacyAddress(privateKey)
-	if err != nil {
-		return "", err
-	}
-
-	addressCache.Set(mnemonic, address)
-	return address, nil
+	return generateLegacyAddress(privateKey)
 }
 
 func chooseOptimalStrategy(words []string, priorityWords []string) GenerationStrategy {
@@ -942,11 +996,6 @@ func completeAndSearch(words []string, target, passphrase string, numCores int, 
 						return
 					}
 
-					if smartScheduler.IsTested(mnemonic) {
-						continue
-					}
-					smartScheduler.MarkTested(mnemonic)
-
 					// Testar com o índice específico
 					address, err := generateAddressFromMnemonicBIP44(mnemonic, passphrase, addressIndex)
 					if err != nil {
@@ -988,15 +1037,19 @@ func completeAndSearch(words []string, target, passphrase string, numCores int, 
 		defer close(workChan)
 
 		generator := NewSmartPermutationGenerator(validWords, currentIndex, strategy, priorityWords)
-		permutations := generator.Generate()
+		candidates := generator.Generate()
 
-		for mnemonic := range permutations {
+		for cand := range candidates {
 			select {
 			case <-done:
 				return
-			case workChan <- mnemonic:
-				currentIndex++
-				lastMnemonic = mnemonic
+			case workChan <- cand.mnemonic:
+				// currentIndex é a RANK (posição) da permutação, não uma
+				// contagem de itens enviados: o filtro de checksum pula a
+				// maioria das permutações sem sequer chegar aqui, então
+				// usamos o rank para refletir o progresso real.
+				currentIndex = cand.rank + 1
+				lastMnemonic = cand.mnemonic
 
 				if time.Since(lastSaveTime) > progressSaveSec*time.Second {
 					if err := saveProgress(validWords, currentIndex, totalPermutations, keysTested, strategyName, priorityWords, lastMnemonic, addressIndex, wordCount); err != nil {
@@ -1009,13 +1062,22 @@ func completeAndSearch(words []string, target, passphrase string, numCores int, 
 				if time.Since(lastReportTime) > 5*time.Second {
 					elapsed := time.Since(startTime).Seconds()
 					currentKeys := atomic.LoadInt64(&keysTested)
-					speed := float64(currentKeys) / elapsed
-					progressPercent := float64(currentIndex) / float64(totalPermutations) * 100
-					remaining := float64(totalPermutations-currentIndex) / speed
 
-					fmt.Printf("⚡ %d/%d (%.2f%%) | %.1f/s | ETA: %.1fh | %s\n",
-						currentIndex, totalPermutations, progressPercent, speed,
-						remaining/3600, formatMnemonicPreview(mnemonic))
+					// scanSpeed: permutações avaliadas por segundo (inclui as
+					// que foram descartadas pelo checksum). É o que determina
+					// o ETA real, já que a maior parte do espaço é eliminada
+					// sem gerar endereço.
+					scanSpeed := float64(currentIndex) / elapsed
+					// deriveSpeed: quantos endereços completos por segundo
+					// realmente são derivados (checksum válido).
+					deriveSpeed := float64(currentKeys) / elapsed
+
+					progressPercent := float64(currentIndex) / float64(totalPermutations) * 100
+					remaining := float64(totalPermutations-currentIndex) / scanSpeed
+
+					fmt.Printf("⚡ %d/%d (%.2f%%) | scan: %.0f/s | válidas: %.0f/s | ETA: %.1fh | %s\n",
+						currentIndex, totalPermutations, progressPercent, scanSpeed, deriveSpeed,
+						remaining/3600, formatMnemonicPreview(cand.mnemonic))
 					lastReportTime = time.Now()
 				}
 			}
